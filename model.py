@@ -597,8 +597,7 @@ class FLOC(StreamClusterer):
     def get_state(self):
         if not self.mcs: return {"k": 0, "centroids": None, "loss": 0.0}
         C = np.stack([self._center(cf) for cf in self.mcs], axis=0)
-        log={"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
-        print(log)
+        print(C.shape)
         return {"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
 
 # Registry
