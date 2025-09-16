@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# https://chatgpt.com/share/68c798e3-ff68-8005-b4cc-af36d0699836
+# https://chatgpt.com/s/t_68c8236029c48191b795565cb20b4cdc
+# https://chatgpt.com/s/t_68c7bd06e2788191824c62455e7bc64a
 import argparse
 import os
 import numpy as np
@@ -63,10 +66,10 @@ def build_algorithms(names: List[str]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algos", type=str, default="floc,online_kmeans,dp_means",
+    parser.add_argument("--algos", type=str, default="floc,online_kmeans,dp_means,demo_random,demo_grid,minibatch_kmeans,denstream,clustream,streamkmpp,",
                         help="Comma-separated algorithm names from model.ALGORITHM_REGISTRY")
     parser.add_argument("--n_points", type=int, default=10000)
-    parser.add_argument("--snapshot_every", type=int, default=100)
+    parser.add_argument("--snapshot_every", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low", type=float, default=-100.0)
     parser.add_argument("--high", type=float, default=100.0)
@@ -119,7 +122,9 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
+
     print("Done. See outputs/ for PNG snapshots and metrics.json.")
+    print(algo.get_state())
 
 if __name__ == "__main__":
     main()
