@@ -186,7 +186,7 @@ def main():
     parser.add_argument("--n_points", type=int, default=10000, help="Number of points/frames to process (cap). Use <=0 for no cap in HuBERT mode.")
     # Alias for convenience/mistype
     parser.add_argument("--n_point", type=int, dest="n_points", help=argparse.SUPPRESS)
-    parser.add_argument("--snapshot_every", type=int, default=5000)
+    parser.add_argument("--snapshot_every", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low", type=float, default=-100.0)
     parser.add_argument("--high", type=float, default=100.0)
@@ -195,6 +195,12 @@ def main():
         type=str,
         default=None,
         help="Path to folder of .npy HuBERT-like features (frames x D). If set, overrides synthetic stream.",
+    )
+    parser.add_argument(
+        "--center_every",
+        type=int,
+        default=5000,
+        help="HuBERT mode: sample centers every N frames to track change curves (<=0 disables tracking).",
     )
     parser.add_argument(
         "--no_progress",
@@ -234,6 +240,63 @@ def main():
     labels: Optional[Dict[str, List[int]]] = None if use_hubert else {name: [] for name in algos}
     points: Optional[List[np.ndarray]] = None if use_hubert else []
 
+    # HuBERT center change tracking
+    center_every = int(args.center_every)
+    center_trackers: Dict[str, Dict[str, Any]] = {name: {
+        'next_id': 0,
+        'prev_centers': None,
+        'prev_track_ids': None,
+        'series': {},  # track_id -> {'steps': [], 'delta': []}
+    } for name in algos} if use_hubert and center_every != 0 else {}
+
+    def _match_and_update_tracks(name: str, step: int, centers: np.ndarray):
+        tr = center_trackers[name]
+        C = np.asarray(centers, dtype=float)
+        if C.size == 0:
+            return
+        if tr['prev_centers'] is None:
+            # initialize tracks
+            track_ids = []
+            for j in range(C.shape[0]):
+                tid = tr['next_id']; tr['next_id'] += 1
+                tr['series'][tid] = {'steps': [step], 'delta': [0.0]}
+                track_ids.append(tid)
+            tr['prev_centers'] = C.copy(); tr['prev_track_ids'] = track_ids
+            return
+        P = tr['prev_centers']; prev_ids = tr['prev_track_ids']
+        # Greedy bipartite matching by nearest distances
+        import itertools
+        pairs = []
+        for i in range(P.shape[0]):
+            diffs = C - P[i][None, :]
+            d2 = np.einsum('ij,ij->i', diffs, diffs)
+            for j in range(C.shape[0]):
+                pairs.append((float(d2[j]), i, j))
+        pairs.sort(key=lambda t: t[0])
+        used_prev = set(); used_curr = set(); match = []
+        for d, i, j in pairs:
+            if i in used_prev or j in used_curr:
+                continue
+            used_prev.add(i); used_curr.add(j)
+            match.append((i, j, float(np.sqrt(d))))
+            if len(used_prev) == P.shape[0] or len(used_curr) == C.shape[0]:
+                break
+        # Update matched tracks
+        curr_track_ids = [None] * C.shape[0]
+        for i, j, dist in match:
+            tid = prev_ids[i]
+            curr_track_ids[j] = tid
+            series = tr['series'].setdefault(tid, {'steps': [], 'delta': []})
+            series['steps'].append(step)
+            series['delta'].append(dist)
+        # New tracks for unmatched current centers
+        for j in range(C.shape[0]):
+            if curr_track_ids[j] is None:
+                tid = tr['next_id']; tr['next_id'] += 1
+                tr['series'][tid] = {'steps': [step], 'delta': [0.0]}
+                curr_track_ids[j] = tid
+        tr['prev_centers'] = C.copy(); tr['prev_track_ids'] = curr_track_ids
+
     processed = 0
     bar = None if args.no_progress else ProgressBar(total=total_display if use_hubert else (args.n_points or None), label="processing")
     for x in stream:
@@ -262,6 +325,14 @@ def main():
                         out_path=os.path.join(OUTPUT_DIR, f"{name}_step_{processed}.png"),
                         title=f"{name} - step {processed}",
                     )
+        elif use_hubert and center_trackers and (processed % max(1, center_every) == 0):
+            # sample centers for change tracking
+            for name, algo in algos.items():
+                state = getattr(algo, "get_state", lambda: {})() or {}
+                C = state.get("centroids", None)
+                if C is None:
+                    continue
+                _match_and_update_tracks(name, processed, np.asarray(C))
 
         # Cap by n_points if provided
         if args.n_points and args.n_points > 0 and processed >= args.n_points:
@@ -301,6 +372,8 @@ def main():
         for name, algo in algos.items():
             state = getattr(algo, "get_state", lambda: {})() or {}
             C = state.get("centroids", None)
+            counts = state.get("counts", None)
+            radii = state.get("radii", None)
             if C is None:
                 k = 0
                 dim_c = int(dim)
@@ -310,7 +383,13 @@ def main():
                 k = int(C.shape[0])
                 dim_c = int(C.shape[1]) if C.ndim == 2 else int(dim)
                 centers_list = C.astype(float).tolist()
-            centers_payload[name] = {"k": k, "dim": dim_c, "centroids": centers_list}
+            centers_payload[name] = {
+                "k": k,
+                "dim": dim_c,
+                "centroids": centers_list,
+                "counts": counts if counts is not None else [],
+                "radii": radii if radii is not None else [],
+            }
             metrics[name] = {"k": k, "sse": None, "loss": state.get("loss", None)}
 
         import json
@@ -319,6 +398,35 @@ def main():
             json.dump(centers_payload, f, ensure_ascii=False)
         for name, info in centers_payload.items():
             print(f"[centers] {name}: k={info['k']}, dim={info['dim']} -> saved to {centers_path}")
+
+        # Plot center change curves
+        if center_trackers:
+            plot_root = os.path.join(OUTPUT_DIR, "center_changes")
+            os.makedirs(plot_root, exist_ok=True)
+            try:
+                import matplotlib.pyplot as plt
+            except Exception as e:
+                print(f"[warn] Could not import matplotlib for center change plots: {e}")
+                plt = None
+            if plt is not None:
+                for name, tr in center_trackers.items():
+                    algo_dir = os.path.join(plot_root, name)
+                    os.makedirs(algo_dir, exist_ok=True)
+                    for tid, series in tr['series'].items():
+                        steps = series.get('steps', [])
+                        delta = series.get('delta', [])
+                        if not steps:
+                            continue
+                        plt.figure(figsize=(6, 3))
+                        plt.plot(steps, delta, label=f"center {tid}")
+                        plt.xlabel("frame")
+                        plt.ylabel("center shift (L2)")
+                        plt.title(f"{name} center {tid} change")
+                        plt.grid(True, alpha=0.3)
+                        plt.tight_layout()
+                        outp = os.path.join(algo_dir, f"center_{tid}.png")
+                        plt.savefig(outp, dpi=140)
+                        plt.close()
 
     import json
     with open(os.path.join(OUTPUT_DIR, "metrics.json"), "w", encoding="utf-8") as f:

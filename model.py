@@ -42,7 +42,7 @@ class DemoRandomClusterer(StreamClusterer):
         for k in range(self.K):
             if self.counts[k] > 0:
                 centroids[k] = self.sums[k] / self.counts[k]
-        return {"k": int(self.K), "centroids": centroids}
+        return {"k": int(self.K), "centroids": centroids, "counts": self.counts.copy().tolist()}
 
 class DemoGridClusterer(StreamClusterer):
     def __init__(self, dim: int = 2, name: str = "demo_grid", cell: float = 20.0):
@@ -74,20 +74,20 @@ class DemoGridClusterer(StreamClusterer):
     def get_state(self) -> Dict[str, Any]:
         k = len(self.bin_to_id)
         if k == 0:
-            return {"k": 0, "centroids": None}
+            return {"k": 0, "centroids": None, "counts": []}
         centroids = np.zeros((k, self.dim), dtype=float)
         for i in range(k):
             c = self.id_to_count[i]
             centroids[i] = self.id_to_sum[i] / max(c, 1.0)
-        return {"k": int(k), "centroids": centroids}
+        return {"k": int(k), "centroids": centroids, "counts": [float(v) for v in self.id_to_count]}
 
 ########################################
 # Online K-Means
 ########################################
 import math
 class OnlineKMeans(StreamClusterer):
-    def __init__(self, dim: int = 256, name: str = "online_kmeans",
-                 K: int = 10, update: str = "count", alpha: float = 0.05, distance: str = "cosine"):
+    def __init__(self, dim: int = 2, name: str = "online_kmeans",
+                 K: int = 30, update: str = "count", alpha: float = 0.05, distance: str = "cosine"):
         super().__init__(dim=dim, name=name)
         self.K = int(K)
         self.update = str(update)
@@ -138,7 +138,7 @@ class OnlineKMeans(StreamClusterer):
 
     def get_state(self):
         k = int(self.centroids.shape[0])
-        return {"k": k, "centroids": self.centroids.copy() if k > 0 else None}
+        return {"k": k, "centroids": self.centroids.copy() if k > 0 else None, "counts": self.counts.copy().tolist() if k > 0 else []}
 
 ########################################
 # Mini-Batch K-Means
@@ -154,6 +154,7 @@ class MiniBatchKMeans(StreamClusterer):
         self.centroids = np.empty((0, dim), dtype=float)
         self._buf = []
         self._init_buf = []
+        self.counts = np.empty((0,), dtype=float)
 
     def _kmeanspp_init(self, X: np.ndarray, K: int):
         n = X.shape[0]
@@ -187,6 +188,7 @@ class MiniBatchKMeans(StreamClusterer):
             if len(self._init_buf) >= max(5 * self.K, 128):
                 Xw = np.stack(self._init_buf, axis=0)
                 self.centroids = self._kmeanspp_init(Xw, self.K)
+                self.counts = np.zeros((self.centroids.shape[0],), dtype=float)
                 self._mini_update(Xw)
                 self._init_buf.clear()
             return 0
@@ -194,6 +196,10 @@ class MiniBatchKMeans(StreamClusterer):
         diffs = self.centroids - x
         j = int(np.argmin(np.einsum('ij,ij->i', diffs, diffs)))
         self._buf.append(x.copy())
+        if self.counts.shape[0] == 0 and self.centroids.shape[0] > 0:
+            self.counts = np.zeros((self.centroids.shape[0],), dtype=float)
+        if self.counts.shape[0] > 0:
+            self.counts[j] += 1.0
         if len(self._buf) >= self.batch_size:
             Xb = np.stack(self._buf, axis=0)
             self._mini_update(Xb)
@@ -202,8 +208,8 @@ class MiniBatchKMeans(StreamClusterer):
 
     def get_state(self):
         if self.centroids.shape[0] == 0:
-            return {"k": 0, "centroids": None}
-        return {"k": int(self.centroids.shape[0]), "centroids": self.centroids.copy()}
+            return {"k": 0, "centroids": None, "counts": []}
+        return {"k": int(self.centroids.shape[0]), "centroids": self.centroids.copy(), "counts": self.counts.copy().tolist() if self.counts.size > 0 else [0.0] * int(self.centroids.shape[0])}
 
 ########################################
 # DP-Means
@@ -248,7 +254,7 @@ class DPMeans(StreamClusterer):
 
     def get_state(self):
         k = int(self.centroids.shape[0])
-        return {"k": k, "centroids": self.centroids.copy() if k > 0 else None}
+        return {"k": k, "centroids": self.centroids.copy() if k > 0 else None, "counts": self.counts.copy().tolist() if k > 0 else []}
 
 ########################################
 # DenStream-Lite
@@ -348,9 +354,10 @@ class DenStreamLite(StreamClusterer):
 
     def get_state(self):
         if not self.p_list:
-            return {"k": 0, "centroids": None}
+            return {"k": 0, "centroids": None, "counts": []}
         C = np.stack([mc.c for mc in self.p_list], axis=0)
-        return {"k": int(C.shape[0]), "centroids": C}
+        W = np.array([mc.w for mc in self.p_list], dtype=float)
+        return {"k": int(C.shape[0]), "centroids": C, "counts": W.tolist()}
 
 ########################################
 # CluStream-Lite
@@ -439,9 +446,11 @@ class CluStreamLite(StreamClusterer):
 
     def get_state(self):
         if not self.mcs:
-            return {"k": 0, "centroids": None}
+            return {"k": 0, "centroids": None, "counts": [], "radii": []}
         C = np.stack([mc.c for mc in self.mcs], axis=0)
-        return {"k": int(C.shape[0]), "centroids": C}
+        N = np.array([mc.N for mc in self.mcs], dtype=float)
+        R = np.array([mc.radius for mc in self.mcs], dtype=float)
+        return {"k": int(C.shape[0]), "centroids": C, "counts": N.tolist(), "radii": R.tolist()}
 
 ########################################
 # StreamKM++
@@ -456,6 +465,7 @@ class StreamKMpp(StreamClusterer):
         self.polish_iters = int(polish_iters)
         self._rng = np.random.default_rng(seed); self._t = 0
         self._reservoir = []; self.centroids = np.empty((0, dim), dtype=float)
+        self.counts = np.empty((0,), dtype=float)
 
     def _kmeanspp_init(self, X: np.ndarray, K: int):
         n = X.shape[0]
@@ -468,8 +478,12 @@ class StreamKMpp(StreamClusterer):
         return np.stack(centers, axis=0)
 
     def _polish(self, X: np.ndarray):
-        if X.shape[0] < self.K: self.centroids = X.copy(); return
+        if X.shape[0] < self.K: 
+            self.centroids = X.copy(); 
+            self.counts = np.zeros((self.centroids.shape[0],), dtype=float)
+            return
         self.centroids = self._kmeanspp_init(X, self.K)
+        self.counts = np.zeros((self.centroids.shape[0],), dtype=float)
         for _ in range(self.polish_iters):
             diffs = X[:, None, :] - self.centroids[None, :, :]
             assign = np.sum(diffs * diffs, axis=2).argmin(axis=1)
@@ -491,12 +505,16 @@ class StreamKMpp(StreamClusterer):
 
         if self.centroids.shape[0] > 0:
             diffs = self.centroids - x
-            j = int(np.argmin(np.einsum('ij,ij->i', diffs, diffs))); return j
+            j = int(np.argmin(np.einsum('ij,ij->i', diffs, diffs)))
+            if self.counts.shape[0] == 0:
+                self.counts = np.zeros((self.centroids.shape[0],), dtype=float)
+            self.counts[j] += 1.0
+            return j
         return 0
 
     def get_state(self):
-        if self.centroids.shape[0] == 0: return {"k": 0, "centroids": None}
-        return {"k": int(self.centroids.shape[0]), "centroids": self.centroids.copy()}
+        if self.centroids.shape[0] == 0: return {"k": 0, "centroids": None, "counts": []}
+        return {"k": int(self.centroids.shape[0]), "centroids": self.centroids.copy(), "counts": self.counts.copy().tolist() if self.counts.size > 0 else [0.0] * int(self.centroids.shape[0])}
 
 ########################################
 # FLOC: Fused-Loss Online Clustering
@@ -639,11 +657,12 @@ class FLOC(StreamClusterer):
         return int(label)
 
     def get_state(self):
-        if not self.mcs: return {"k": 0, "centroids": None, "loss": 0.0}
+        if not self.mcs: 
+            return {"k": 0, "centroids": None, "loss": 0.0, "counts": [], "radii": []}
         C = np.stack([self._center(cf) for cf in self.mcs], axis=0)
-        log={"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
-        print(log)
-        return {"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
+        counts = [float(cf.N) for cf in self.mcs]
+        radii = [float(np.sqrt(FLOC._radius2(cf))) for cf in self.mcs]
+        return {"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total()), "counts": counts, "radii": radii}
 
 # Registry
 ALGORITHM_REGISTRY = {
