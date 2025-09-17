@@ -4,10 +4,10 @@
 # https://chatgpt.com/s/t_68c7bd06e2788191824c62455e7bc64a
 import argparse
 import os
+import glob
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterable, Optional
 from model import ALGORITHM_REGISTRY
-from viz import save_scatter_snapshot
 from metrics import compute_sse
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
@@ -56,75 +56,204 @@ def gen_stream(
         pt = np.clip(pt, low, high)
         yield (pt, label) if return_label else pt
 
-def build_algorithms(names: List[str]):
+
+def _iter_npy_files(root: str) -> Iterable[str]:
+    """Yield .npy file paths under `root` (recursively), sorted deterministically."""
+    root = os.path.abspath(root)
+    # Prefer a 3-level pattern like dev-clean/*/*/*.npy; fallback to recursive walk.
+    pattern = os.path.join(root, "**", "*.npy")
+    files = sorted(glob.glob(pattern, recursive=True))
+    for p in files:
+        if os.path.isfile(p) and p.lower().endswith(".npy"):
+            yield p
+
+
+def infer_hubert_dim(root: str) -> int:
+    """Infer feature dimension from the first .npy file under `root`.
+    Expects arrays of shape (T, D) or (D,). Returns D.
+    """
+    for p in _iter_npy_files(root):
+        a = np.load(p, mmap_mode="r")
+        if a.ndim == 1:
+            return int(a.shape[0])
+        elif a.ndim == 2:
+            return int(a.shape[1])
+        else:
+            raise ValueError(f"Unsupported npy shape {a.shape} in {p}")
+    raise FileNotFoundError(f"No .npy files found under {root}")
+
+
+def hubert_stream(root: str) -> Iterable[np.ndarray]:
+    """Stream 1D feature frames from a folder of .npy files.
+
+    Each file may be (T, D) or (D,). This yields row vectors (D,) sequentially
+    across files in sorted order.
+    """
+    for p in _iter_npy_files(root):
+        a = np.load(p)
+        if a.ndim == 1:
+            yield a.astype(float).reshape(-1)
+        elif a.ndim == 2:
+            # Stream per-frame
+            for i in range(a.shape[0]):
+                yield a[i].astype(float).reshape(-1)
+        else:
+            raise ValueError(f"Unsupported npy shape {a.shape} in {p}")
+
+def build_algorithms(names: List[str], dim: int):
     algos = {}
     for name in names:
         if name not in ALGORITHM_REGISTRY:
-            raise ValueError(f"Algorithm '{name}' not found. Available: {list(ALGORITHM_REGISTRY.keys())}")
-        algos[name] = ALGORITHM_REGISTRY[name](dim=2, name=name)
+            raise ValueError(
+                f"Algorithm '{name}' not found. Available: {list(ALGORITHM_REGISTRY.keys())}"
+            )
+        try:
+            algos[name] = ALGORITHM_REGISTRY[name](dim=int(dim), name=name)
+        except AssertionError as e:
+            # Gracefully skip algos that assert on dim (e.g., demo_grid needs 2D)
+            print(f"[warn] Skip algo '{name}' for dim={dim}: {e}")
+        except Exception as e:
+            raise
+    if not algos:
+        raise RuntimeError("No algorithms instantiated — check names and dim compatibility.")
     return algos
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algos", type=str, default="floc,online_kmeans,dp_means,demo_random,demo_grid,minibatch_kmeans,denstream,clustream,streamkmpp,",
-                        help="Comma-separated algorithm names from model.ALGORITHM_REGISTRY")
-    parser.add_argument("--n_points", type=int, default=10000)
+    parser.add_argument(
+        "--algos",
+        type=str,
+        default=(
+            "floc,online_kmeans,dp_means,demo_random,demo_grid,minibatch_kmeans,denstream,clustream,streamkmpp,"
+        ),
+        help="Comma-separated algorithm names from model.ALGORITHM_REGISTRY",
+    )
+    parser.add_argument("--n_points", type=int, default=10000, help="Number of points/frames to process (cap). Use <=0 for no cap in HuBERT mode.")
+    # Alias for convenience/mistype
+    parser.add_argument("--n_point", type=int, dest="n_points", help=argparse.SUPPRESS)
     parser.add_argument("--snapshot_every", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low", type=float, default=-100.0)
     parser.add_argument("--high", type=float, default=100.0)
+    parser.add_argument(
+        "--hubert",
+        type=str,
+        default=None,
+        help="Path to folder of .npy HuBERT-like features (frames x D). If set, overrides synthetic stream.",
+    )
     args = parser.parse_args()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     algo_names = [s.strip() for s in args.algos.split(",") if s.strip()]
-    algos = build_algorithms(algo_names)
 
-    labels: Dict[str, List[int]] = {name: [] for name in algo_names}
-    points: List[np.ndarray] = []
-    
-    for step, x in enumerate(gen_stream(args.n_points, args.low, args.high, seed=args.seed), start=1):
-        points.append(x)
+    # Choose data source and dimension
+    use_hubert = bool(args.hubert)
+    if use_hubert:
+        dim = infer_hubert_dim(args.hubert)
+        stream = hubert_stream(args.hubert)
+        if args.n_points and args.n_points > 0:
+            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, cap={args.n_points} frames")
+        else:
+            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, no cap (process all frames)")
+    else:
+        dim = 2
+        stream = gen_stream(args.n_points, args.low, args.high, seed=args.seed)
+        print(f"[info] Synthetic mode: 2D stream, seed={args.seed}")
+
+    algos = build_algorithms(algo_names, dim=dim)
+
+    labels: Optional[Dict[str, List[int]]] = None if use_hubert else {name: [] for name in algos}
+    points: Optional[List[np.ndarray]] = None if use_hubert else []
+
+    processed = 0
+    for x in stream:
+        processed += 1
+        if not use_hubert:
+            points.append(x)
         for name, algo in algos.items():
             label = algo.partial_fit(x)
-            labels[name].append(int(label))
+            if labels is not None:
+                labels[name].append(int(label))
 
-        if (step % args.snapshot_every == 0) or (step == args.n_points):
+        if (not use_hubert) and ((processed % args.snapshot_every == 0) or (processed == args.n_points)):
             P = np.vstack(points)
             for name, algo in algos.items():
                 lbl = np.array(labels[name], dtype=int)
                 state = getattr(algo, "get_state", lambda: {})() or {}
                 centroids = state.get("centroids", None)
-                save_scatter_snapshot(P, lbl, centroids,
-                                      out_path=os.path.join(OUTPUT_DIR, f"{name}_step_{step}.png"),
-                                      title=f"{name} - step {step}")
+                # Only visualize when dim==2
+                if P.shape[1] == 2:
+                    from viz import save_scatter_snapshot  # lazy import to avoid MPL in non-2D mode
+                    save_scatter_snapshot(
+                        P,
+                        lbl,
+                        centroids,
+                        out_path=os.path.join(OUTPUT_DIR, f"{name}_step_{processed}.png"),
+                        title=f"{name} - step {processed}",
+                    )
 
-    metrics = {}
-    P = np.vstack(points)
-    for name, algo in algos.items():
-        lbl = np.array(labels[name], dtype=int)
-        state = getattr(algo, "get_state", lambda: {})() or {}
-        centroids = state.get("centroids", None)
-        k_from_state = state.get("k", None)
-        k_from_labels = int(lbl.max()) + 1 if lbl.size > 0 else 0
-        k = int(k_from_state) if isinstance(k_from_state, (int, np.integer)) else k_from_labels
+        # Cap by n_points if provided
+        if args.n_points and args.n_points > 0 and processed >= args.n_points:
+            break
 
-        sse = None
-        if centroids is not None:
-            sse = float(compute_sse(P, lbl, np.asarray(centroids)))
+    # Final metrics and optional visualization (2D only)
+    metrics: Dict[str, Dict[str, Any]] = {}
+    if not use_hubert:
+        P = np.vstack(points) if points else np.empty((0, dim), dtype=float)
+        for name, algo in algos.items():
+            lbl = np.array(labels[name], dtype=int) if labels is not None else np.zeros((P.shape[0],), dtype=int)
+            state = getattr(algo, "get_state", lambda: {})() or {}
+            centroids = state.get("centroids", None)
+            k_from_state = state.get("k", None)
+            k_from_labels = int(lbl.max()) + 1 if lbl.size > 0 else 0
+            k = int(k_from_state) if isinstance(k_from_state, (int, np.integer)) else k_from_labels
 
-        save_scatter_snapshot(P, lbl, centroids,
-                              out_path=os.path.join(OUTPUT_DIR, f"{name}_final.png"),
-                              title=f"{name} - final (n={args.n_points})")
+            sse = None
+            if centroids is not None and P.size > 0:
+                sse = float(compute_sse(P, lbl, np.asarray(centroids)))
 
-        metrics[name] = {"k": k, "sse": sse, "loss": state.get("loss", None)}
+            if P.shape[1] == 2:
+                from viz import save_scatter_snapshot  # lazy import to avoid MPL in non-2D mode
+                save_scatter_snapshot(
+                    P,
+                    lbl,
+                    centroids,
+                    out_path=os.path.join(OUTPUT_DIR, f"{name}_final.png"),
+                    title=f"{name} - final (n={processed})",
+                )
+
+            metrics[name] = {"k": k, "sse": sse, "loss": state.get("loss", None)}
+    else:
+        # In HuBERT mode, export centroids to JSON and print K/shape info
+        centers_payload: Dict[str, Dict[str, Any]] = {}
+        for name, algo in algos.items():
+            state = getattr(algo, "get_state", lambda: {})() or {}
+            C = state.get("centroids", None)
+            if C is None:
+                k = 0
+                dim_c = int(dim)
+                centers_list = []
+            else:
+                C = np.asarray(C)
+                k = int(C.shape[0])
+                dim_c = int(C.shape[1]) if C.ndim == 2 else int(dim)
+                centers_list = C.astype(float).tolist()
+            centers_payload[name] = {"k": k, "dim": dim_c, "centroids": centers_list}
+            metrics[name] = {"k": k, "sse": None, "loss": state.get("loss", None)}
+
+        import json
+        centers_path = os.path.join(OUTPUT_DIR, "centroids.json")
+        with open(centers_path, "w", encoding="utf-8") as f:
+            json.dump(centers_payload, f, ensure_ascii=False)
+        for name, info in centers_payload.items():
+            print(f"[centers] {name}: k={info['k']}, dim={info['dim']} -> saved to {centers_path}")
 
     import json
     with open(os.path.join(OUTPUT_DIR, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
 
-    print("Done. See outputs/ for PNG snapshots and metrics.json.")
-    print(algo.get_state())
+    print("Done. See outputs/ for PNG snapshots (2D) and metrics.json.")
 
 if __name__ == "__main__":
     main()

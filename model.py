@@ -84,10 +84,10 @@ class DemoGridClusterer(StreamClusterer):
 ########################################
 # Online K-Means
 ########################################
-
+import math
 class OnlineKMeans(StreamClusterer):
-    def __init__(self, dim: int = 2, name: str = "online_kmeans",
-                 K: int = 50, update: str = "count", alpha: float = 0.05, distance: str = "cosine"):
+    def __init__(self, dim: int = 256, name: str = "online_kmeans",
+                 K: int = 10, update: str = "count", alpha: float = 0.05, distance: str = "cosine"):
         super().__init__(dim=dim, name=name)
         self.K = int(K)
         self.update = str(update)
@@ -112,21 +112,27 @@ class OnlineKMeans(StreamClusterer):
 
     def partial_fit(self, x: np.ndarray) -> int:
         x = np.asarray(x, dtype=float).reshape(-1)
-        if self.centroids.shape[0] < self.K:
-            self.centroids = np.vstack([self.centroids, x[None, :]])
+        # if self.centroids.shape[0] < self.K:
+        #     self.centroids = np.vstack([self.centroids, x[None, :]])
+        #     self.counts = np.append(self.counts, 1.0)
+        #     return int(self.centroids.shape[0] - 1)
+        rng = np.random.default_rng(42)
+        while self.centroids.shape[0] < self.K:
+            tmp = rng.uniform(-1, 1, size=x.shape)
+            self.centroids = np.vstack([self.centroids, tmp[None, :]])
             self.counts = np.append(self.counts, 1.0)
-            return int(self.centroids.shape[0] - 1)
+            
 
         d2 = getattr(self, f"{self.distance}_distances")(x)
         j = int(np.argmin(d2))
 
         if self.update == "ema":
-            eta = self.alpha
+            eta = self.alpha  #*(2-d2[j])
             self.centroids[j] = (1.0 - eta) * self.centroids[j] + eta * x
             self.counts[j] += 1.0
         else:
             self.counts[j] += 1.0
-            eta = 1.0 / self.counts[j]
+            eta =  (1.0 / (1+self.counts[j]))**0.4 #*(2-d2[j])#  math.sqrt(1.0 / self.counts[j])
             self.centroids[j] = self.centroids[j] + eta * (x - self.centroids[j])
         return j
 
@@ -591,14 +597,39 @@ class FLOC(StreamClusterer):
                 merges_done += 1
             else:
                 break
+    def linear_normalize(self,x):
+        x = x - np.min(x)
+        if np.sum(x) == 0:
+            return np.ones_like(x) / len(x)
+        return 2*x / np.sum(x)-1
+    
+    def min_max_normalize_neg1(self,x):
+        """线性缩放到[-1, 1]区间"""
+        x_min = np.min(x)
+        x_max = np.max(x)
+        
+        if x_max == x_min:  # 所有值相同
+            return np.zeros_like(x)
+        
+        # 公式: 2 * (x - x_min) / (x_max - x_min) - 1
+        normalized = 2 * (x - x_min) / (x_max - x_min) - 1
+        return normalized
+    def softmax(self,x, axis=1,tau=1.0):
+        x = np.asarray(x, dtype=float).reshape(-1)
+        x = x / tau
+        # 减去最大值提高数值稳定性（防止指数爆炸）
+        e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
     def partial_fit(self, x: np.ndarray) -> int:
         x = np.asarray(x, dtype=float).reshape(-1); self.t += 1
         if not self.mcs:
             self._new_cf(x); return 0
         scores = [self._score(x, cf) for cf in self.mcs]
+        # print(self.softmax(scores,axis=0,tau=10.0))
+        # print(self.linear_normalize(scores))
         j = int(np.argmin(scores))
-        if scores[j] > self.lambda_new and (len(self.mcs) < self.max_k * 3):
+        if scores[j] > self.lambda_new and (len(self.mcs) < self.max_k):
             self._new_cf(x); label = len(self.mcs) - 1
         else:
             cf = self.mcs[j]; self._decay_to_now(cf)
@@ -610,7 +641,8 @@ class FLOC(StreamClusterer):
     def get_state(self):
         if not self.mcs: return {"k": 0, "centroids": None, "loss": 0.0}
         C = np.stack([self._center(cf) for cf in self.mcs], axis=0)
-        print(C.shape)
+        log={"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
+        print(log)
         return {"k": int(C.shape[0]), "centroids": C, "loss": float(self._loss_total())}
 
 # Registry
