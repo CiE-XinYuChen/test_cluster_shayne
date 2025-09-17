@@ -4,6 +4,8 @@
 # https://chatgpt.com/s/t_68c7bd06e2788191824c62455e7bc64a
 import argparse
 import os
+import sys
+import time
 import glob
 import numpy as np
 from typing import List, Dict, Any, Iterable, Optional
@@ -100,6 +102,59 @@ def hubert_stream(root: str) -> Iterable[np.ndarray]:
         else:
             raise ValueError(f"Unsupported npy shape {a.shape} in {p}")
 
+
+def count_hubert_frames(root: str) -> int:
+    """Count total number of frames across all .npy files under root.
+    (T,D) contributes T; (D,) contributes 1.
+    """
+    total = 0
+    for p in _iter_npy_files(root):
+        a = np.load(p, mmap_mode="r")
+        if a.ndim == 1:
+            total += 1
+        elif a.ndim == 2:
+            total += int(a.shape[0])
+        else:
+            raise ValueError(f"Unsupported npy shape {a.shape} in {p}")
+    return int(total)
+
+
+class ProgressBar:
+    def __init__(self, total: Optional[int] = None, width: int = 40, label: str = "progress"):
+        self.total = total if (total is None or total > 0) else None
+        self.width = max(10, int(width))
+        self.label = label
+        self.n = 0
+        self._last_draw = 0.0
+        self._spinner = ['-', '\\', '|', '/']
+        self._spin_idx = 0
+
+    def _draw(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_draw) < 0.05:
+            return
+        self._last_draw = now
+        if self.total is None:
+            ch = self._spinner[self._spin_idx % len(self._spinner)]
+            self._spin_idx += 1
+            line = f"[{ch}] {self.label}: {self.n}"
+        else:
+            ratio = min(1.0, self.n / max(self.total, 1))
+            filled = int(ratio * self.width)
+            bar = '#' * filled + '-' * (self.width - filled)
+            line = f"[{bar}] {self.label}: {self.n}/{self.total} ({ratio*100:5.1f}%)"
+        sys.stdout.write('\r' + line)
+        sys.stdout.flush()
+
+    def step(self, inc: int = 1):
+        self.n += int(inc)
+        self._draw()
+
+    def close(self):
+        self._draw(force=True)
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
 def build_algorithms(names: List[str], dim: int):
     algos = {}
     for name in names:
@@ -141,6 +196,11 @@ def main():
         default=None,
         help="Path to folder of .npy HuBERT-like features (frames x D). If set, overrides synthetic stream.",
     )
+    parser.add_argument(
+        "--no_progress",
+        action="store_true",
+        help="Disable progress bar logging during processing.",
+    )
     args = parser.parse_args()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -151,10 +211,19 @@ def main():
     if use_hubert:
         dim = infer_hubert_dim(args.hubert)
         stream = hubert_stream(args.hubert)
+        total_available = None
+        if not args.no_progress:
+            try:
+                total_available = count_hubert_frames(args.hubert)
+            except Exception as e:
+                print(f"[warn] Could not pre-count frames: {e}")
         if args.n_points and args.n_points > 0:
-            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, cap={args.n_points} frames")
+            cap = int(args.n_points)
+            total_display = min(cap, total_available) if total_available else cap
+            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, cap={cap} frames (total≈{total_available if total_available is not None else 'unknown'})")
         else:
-            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, no cap (process all frames)")
+            total_display = total_available
+            print(f"[info] HuBERT mode: dim={dim}, root={args.hubert}, no cap (process all frames, total≈{total_available if total_available is not None else 'unknown'})")
     else:
         dim = 2
         stream = gen_stream(args.n_points, args.low, args.high, seed=args.seed)
@@ -166,6 +235,7 @@ def main():
     points: Optional[List[np.ndarray]] = None if use_hubert else []
 
     processed = 0
+    bar = None if args.no_progress else ProgressBar(total=total_display if use_hubert else (args.n_points or None), label="processing")
     for x in stream:
         processed += 1
         if not use_hubert:
@@ -174,6 +244,7 @@ def main():
             label = algo.partial_fit(x)
             if labels is not None:
                 labels[name].append(int(label))
+        if bar: bar.step()
 
         if (not use_hubert) and ((processed % args.snapshot_every == 0) or (processed == args.n_points)):
             P = np.vstack(points)
@@ -197,6 +268,7 @@ def main():
             break
 
     # Final metrics and optional visualization (2D only)
+    if bar: bar.close()
     metrics: Dict[str, Dict[str, Any]] = {}
     if not use_hubert:
         P = np.vstack(points) if points else np.empty((0, dim), dtype=float)
